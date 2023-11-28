@@ -10,8 +10,9 @@ import argparse
 import logging
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-
-
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import classification_report
 
 def preprocess_function(examples, **fn_kwargs):
     return fn_kwargs['tokenizer'](examples["text"], truncation=True)
@@ -42,121 +43,18 @@ def compute_metrics(eval_pred):
     return results
 
 
-def fine_tune(train_df, valid_df, checkpoints_path, id2label, label2id, model):
+def measure_test_perplexity(model, tokenizer, data):
+    perplexity_scores = []
 
-    # pandas dataframe to huggingface Dataset
-    train_dataset = Dataset.from_pandas(train_df)
-    valid_dataset = Dataset.from_pandas(valid_df)
-    
-    # get tokenizer and model from huggingface
-    tokenizer = AutoTokenizer.from_pretrained(model)     # put your model here
-    model = AutoModelForSequenceClassification.from_pretrained(
-       model, num_labels=len(label2id), id2label=id2label, label2id=label2id    # put your model here
-    )
-    
-    # tokenize data for train/valid
-    tokenized_train_dataset = train_dataset.map(preprocess_function, batched=True, fn_kwargs={'tokenizer': tokenizer})
-    tokenized_valid_dataset = valid_dataset.map(preprocess_function, batched=True,  fn_kwargs={'tokenizer': tokenizer})
-    
-
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-
-    # create Trainer 
-    training_args = TrainingArguments(
-        output_dir=checkpoints_path,
-        learning_rate=2e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=3,
-        weight_decay=0.01,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_train_dataset,
-        eval_dataset=tokenized_valid_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
-    trainer.train()
-
-    # save best model
-    best_model_path = checkpoints_path+'/best/'
-    
-    if not os.path.exists(best_model_path):
-        os.makedirs(best_model_path)
-    
-
-    trainer.save_model(best_model_path)
-
-
-def test(test_df, model_path, id2label, label2id):
-    
-    # load tokenizer from saved model 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    # load best model
-    model = AutoModelForSequenceClassification.from_pretrained(
-       model_path, num_labels=len(label2id), id2label=id2label, label2id=label2id
-    )
-            
-    test_dataset = Dataset.from_pandas(test_df)
-
-    tokenized_test_dataset = test_dataset.map(preprocess_function, batched=True,  fn_kwargs={'tokenizer': tokenizer})
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-    # create Trainer
-    trainer = Trainer(
-        model=model,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-    # get logits from predictions and evaluate results using classification report
-    predictions = trainer.predict(tokenized_test_dataset)
-    prob_pred = softmax(predictions.predictions, axis=-1)
-    preds = np.argmax(predictions.predictions, axis=-1)
-    metric = evaluate.load("bstrai/classification_report")
-    results = metric.compute(predictions=preds, references=predictions.label_ids)
-    
-    # return dictionary of classification report
-    return results, preds
-
-def measure_perplexity(model, tokenizer, data):
-    machine_rows = data[data["label"] == 0]
-    human_rows = data[data["label"] == 1]
-    machine_rows = list(machine_rows.sample(n = 100)["text"])
-    human_rows = list(human_rows.sample(n = 100)["text"])
-    avg_machine_perplexity = 0
-    for row in machine_rows:
-        row = row[:100]
-        inputs = tokenizer(row, return_tensors = "pt")
-        loss = model(input_ids = inputs["input_ids"], labels = inputs["input_ids"]).loss
+    for row in data["text"]:
+        row = row[:300]  # Considering the first 100 tokens for simplicity
+        inputs = tokenizer(row, return_tensors="pt")
+        loss = model(input_ids=inputs["input_ids"], labels=inputs["input_ids"]).loss
         ppl = torch.exp(loss)
         ppl = ppl.item()
-        avg_machine_perplexity += ppl
-    avg_machine_perplexity /= len(machine_rows)
+        perplexity_scores.append(ppl)
 
-    avg_human_perplexity = 0
-    for row in human_rows:
-        row = row[:100]
-        inputs = tokenizer(row, return_tensors = "pt")
-        loss = model(input_ids = inputs["input_ids"], labels = inputs["input_ids"]).loss
-        ppl = torch.exp(loss)
-        ppl = ppl.item()
-        avg_human_perplexity += ppl
-    avg_human_perplexity /= len(human_rows)
-
-    return avg_machine_perplexity, avg_human_perplexity    
-
-
+    return perplexity_scores
 
 
 if __name__ == '__main__':
@@ -199,30 +97,28 @@ if __name__ == '__main__':
 
     set_seed(random_seed)
 
-    #get data for train/dev/test sets
     train_df, valid_df, test_df = get_data(train_path, test_path, random_seed)
     
-    # train detector model
+    
     if args.feat_perplexity:
         perp_model = AutoModelForCausalLM.from_pretrained("gpt2")
         perpl_tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        avg_machine_perplexity, avg_human_perplexity = measure_perplexity(perp_model, perpl_tokenizer, train_df)
-        print("Average machine perplexity: ", avg_machine_perplexity)
-        print("Average human perplexity: ", avg_human_perplexity)
+        train_df = train_df.head(10000)
+        valid_df = valid_df.head(3000)
+        perplexity_scores = measure_test_perplexity(perp_model, perpl_tokenizer, train_df)
 
-    
-
-    # # test detector model
-    # results, predictions = test(test_df, f"{model}/subtask{subtask}/{random_seed}/best/", id2label, label2id)
-    
-    # logging.info(results)
-    # predictions_df = pd.DataFrame({'id': test_df['id'], 'label': predictions})
-    # predictions_df.to_json(prediction_path, lines=True, orient='records')
+        features = np.array(perplexity_scores).reshape(-1, 1)
 
 
+        svm_classifier = SVC(kernel='linear', random_state=42)
+        svm_classifier.fit(features, train_df['label'])
 
-# if __name__=="__main__":
-#     inputs = tokenizer("ABC is a startup based in New York City and Paris", return_tensors = "pt")
-#     loss = model(input_ids = inputs["input_ids"], labels = inputs["input_ids"]).loss
-#     ppl = torch.exp(loss)
-#     print(ppl.item())
+        valid_perplexity_scores = measure_test_perplexity(perp_model, perpl_tokenizer, valid_df)
+        valid_features = np.array(valid_perplexity_scores).reshape(-1, 1)
+
+        pred = svm_classifier.predict(valid_features)
+        
+        
+        print(classification_report( valid_df['label'], pred))
+  
+        
